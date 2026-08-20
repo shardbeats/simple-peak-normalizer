@@ -65,11 +65,10 @@ Place `icon.ico` next to `build_exe.py` to have it included in the next build.
 ```
 peak_normalizer/
 ├── main.py          # Entry point
-├── gui.py           # GUI (layout built in code)
+├── gui.py           # GUI
 ├── normalizer.py    # Engine: peak analysis, normalization, folder mirroring
 ├── styles.qss       # Dark theme
 ├── build_exe.py     # PyInstaller build script
-├── make_icon.py     # Generates icon.ico / icon.png
 ├── requirements.txt
 ├── start.bat        # Setup + launch
 ```
