@@ -1,4 +1,4 @@
-"""Build a portable .exe of Peak Normalizer with PyInstaller.
+"""Build a portable .exe of Simple Peak Normalizer with PyInstaller.
 
 Bundles the FFmpeg binaries (ffmpeg.exe / ffprobe.exe) and styles.qss
 inside the one-file executable. Run from the project folder:
