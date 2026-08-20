@@ -1,4 +1,4 @@
-"""Peak Normalizer - Entry point."""
+"""Simple Peak Normalizer - Entry point."""
 
 from gui import main
 
