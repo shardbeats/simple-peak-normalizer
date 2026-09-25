@@ -52,6 +52,19 @@ python -m venv .venv
 python build_exe.py
 ```
 
+## Tests
+
+```
+pip install -r requirements-dev.txt
+python -m pytest tests -q
+```
+
+50 tests covering: output-path resolution, codec/bit-depth selection,
+file discovery, binary resolution, peak measurement and end-to-end
+normalization. The ffmpeg integration tests generate tiny tones on the
+fly (no audio fixtures in the repo) and skip gracefully if ffmpeg is
+not on PATH.
+
 To regenerate the app icon:
 
 ```
