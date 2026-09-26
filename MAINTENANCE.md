@@ -78,17 +78,7 @@ python build_exe.py   # builds dist\SimplePeakNormalizer.exe
 - Quick check: 1 quiet file (−12 dB) → comes out `*_N` at target;
   passing the same file again → skipped by suffix.
 
-## 6. Release checklist
-
-1. `git status` free of artifacts (`build/`, `dist/`, `.venv/`, `*.log`).
-2. `python -m pytest tests -q` green (and green CI on GitHub).
-3. README up to date (formats = `SUPPORTED_EXTENSIONS`, default
-   target/tolerance = `normalize_file`).
-4. Test the exe on a clean PC/folder: normalizes, honors tolerance,
-   replace mode only deletes the original when writing next to the source.
-5. Upload the exe to GitHub Releases (never committed: `dist/` is ignored).
-
-## 7. Decided behaviors (not bugs)
+## 6. Decided behaviors (not bugs)
 
 - **Each clip is normalized to its OWN peak.** Not loudness (LUFS) and not
   batch normalization to a common level: linear per-file gain.
@@ -104,7 +94,7 @@ python build_exe.py   # builds dist\SimplePeakNormalizer.exe
 - **Stateless.** The app stores no settings or history; there is nothing
   to migrate or back up beyond the code (GitHub).
 
-## 8. Tests
+## 7. Tests
 
 ```
 pip install -r requirements-dev.txt
@@ -115,4 +105,4 @@ python -m pytest tests -q
 measurement and end-to-end normalization with on-the-fly generated tones
 (no audio fixtures in the repo). Integration tests skip automatically
 when ffmpeg is not on PATH. The GUI is not tested
-(manual check with §6 instead).
+(manual verification instead).
