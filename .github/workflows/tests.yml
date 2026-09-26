@@ -22,7 +22,25 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - name: Install ffmpeg (Windows)
         if: runner.os == 'Windows'
-        run: choco install ffmpeg -y
+        shell: pwsh
+        run: |
+          if (Get-Command ffmpeg -ErrorAction SilentlyContinue) {
+            exit 0
+          }
+
+          $maxAttempts = 3
+          for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+            choco install ffmpeg -y
+            if ($LASTEXITCODE -eq 0 -and (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
+              break
+            }
+
+            if ($attempt -eq $maxAttempts) {
+              throw "Failed to install ffmpeg with Chocolatey after $maxAttempts attempts."
+            }
+
+            Start-Sleep -Seconds 15
+          }
       - name: Verify ffmpeg
         run: ffmpeg -version
       - name: Install dependencies
