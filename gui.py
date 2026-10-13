@@ -3,6 +3,7 @@
 """
 
 import sys
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -21,6 +22,7 @@ from PySide6.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent, QIcon, QF
 from normalizer import (
     find_audio_files, check_ffmpeg,
     normalize_file, NormalizeResult, SKIP_SUFFIX,
+    SUPPORTED_EXTENSIONS, MAX_QUEUE_SIZE,
 )
 
 
@@ -45,6 +47,7 @@ class NormalizeWorker(QRunnable):
         preserve_structure: bool = False,
         index: int = 0,
         total: int = 0,
+        cancel_event: Optional[threading.Event] = None,
     ):
         super().__init__()
         self.input_path = input_path
@@ -56,13 +59,21 @@ class NormalizeWorker(QRunnable):
         self.preserve_structure = preserve_structure
         self.index = index
         self.total = total
+        self.cancel_event = cancel_event
         self.signals = WorkerSignals()
 
     def run(self):
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            self.signals.finished.emit(
+                NormalizeResult(False, self.input_path, error="Cancelled")
+            )
+            self.signals.progress.emit(self.index, self.total)
+            return
         self.signals.started.emit(self.input_path)
         result = normalize_file(
             self.input_path, self.mode, self.target_db, self.tolerance_db,
             self.output_dir, self.source_root, self.preserve_structure,
+            cancel_event=self.cancel_event,
         )
         self.signals.finished.emit(result)
         self.signals.progress.emit(self.index, self.total)
@@ -203,6 +214,11 @@ class MainWindow(QMainWindow):
         self.output_dir: Optional[Path] = None
         self.thread_pool = QThreadPool()
         self.thread_pool.setMaxThreadCount(2)
+        # Batch-run state (completion counted, never inferred from order).
+        self._is_converting = False
+        self._completed = 0
+        self._total = 0
+        self._cancel_event = threading.Event()
 
         self._counts = {"normalized": 0, "skipped_range": 0,
                         "skipped_suffix": 0, "failed": 0}
@@ -415,6 +431,14 @@ class MainWindow(QMainWindow):
         self.convert_btn.setEnabled(False)
         self.convert_btn.clicked.connect(self.start_normalization)
         progress_layout.addWidget(self.convert_btn)
+
+        self.cancel_btn = QPushButton("CANCEL")
+        self.cancel_btn.setObjectName("cancel_btn")
+        self.cancel_btn.setMinimumHeight(20)
+        self.cancel_btn.setToolTip("Stop the batch (running files are killed)")
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.clicked.connect(self.cancel_normalization)
+        progress_layout.addWidget(self.cancel_btn)
         sections.addWidget(progress_panel, 28)
 
         # ---- Footer ----
@@ -459,15 +483,27 @@ class MainWindow(QMainWindow):
         """Add files/folders to the queue (skipping already processed *_N).
 
         Each file keeps its source_root (the scanned folder), so the folder
-        structure can be preserved later.
+        structure can be preserved later. Bounded + globally deduped.
         """
+        if self._is_converting:
+            return
         new_pairs: list[tuple[Path, Optional[Path]]] = []
         for path in paths:
-            if path.is_dir():
-                for f in find_audio_files(path, recursive=True):
-                    new_pairs.append((f, path))
-            elif path.is_file():
-                new_pairs.append((path, None))
+            try:
+                if path.is_dir():
+                    for f in find_audio_files(path, recursive=True):
+                        new_pairs.append((f, path))
+                elif path.is_file():
+                    try:
+                        if path.is_symlink():
+                            continue
+                    except OSError:
+                        continue
+                    if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+                        continue
+                    new_pairs.append((path, None))
+            except OSError:
+                continue
 
         # Skip files that are already normalized versions (*_N)
         new_pairs = [
@@ -475,13 +511,35 @@ class MainWindow(QMainWindow):
             if not f.stem.lower().endswith(SKIP_SUFFIX.lower())
         ]
 
-        seen = set(fs for (fs, _) in self.pending_files)
+        # Deduplicate against the existing queue AND within the batch
+        # (resolved paths on both sides, so case/junction dupes can't slip).
+        seen = set()
+        for fs, _ in self.pending_files:
+            try:
+                seen.add(fs.resolve())
+            except OSError:
+                seen.add(Path(fs))
+        added = 0
         for f, root in new_pairs:
-            resolved = f.resolve()
+            try:
+                resolved = f.resolve()
+            except OSError:
+                continue
             if resolved in seen:
                 continue
+            if len(self.pending_files) >= MAX_QUEUE_SIZE:
+                break
             seen.add(resolved)
             self.pending_files.append((f, root))
+            added += 1
+
+        if len(new_pairs) > added and len(self.pending_files) >= MAX_QUEUE_SIZE:
+            self.status_label.setText(f"Queue capped at {MAX_QUEUE_SIZE} files")
+            QMessageBox.warning(
+                self, "Queue limit",
+                f"The queue is capped at {MAX_QUEUE_SIZE} files to protect "
+                f"CPU/RAM. Add the rest in a second batch.",
+            )
 
         self.rebuild_list()
         self.update_start_button()
@@ -527,6 +585,8 @@ class MainWindow(QMainWindow):
             self.file_list.setMaximumHeight(160)
 
     def remove_selected(self):
+        if self._is_converting:
+            return
         for item in self.file_list.selectedItems():
             pair = item.data(Qt.ItemDataRole.UserRole)
             if pair in self.pending_files:
@@ -535,6 +595,8 @@ class MainWindow(QMainWindow):
         self.update_start_button()
 
     def clear_queue(self):
+        if self._is_converting:
+            return
         self.pending_files.clear()
         self.rebuild_list()
         self.update_start_button()
@@ -567,6 +629,9 @@ class MainWindow(QMainWindow):
             self.output_label.setToolTip(str(self.output_dir))
 
     def update_start_button(self):
+        if self._is_converting:
+            self.convert_btn.setEnabled(False)
+            return
         has_files = len(self.pending_files) > 0
         self.convert_btn.setEnabled(has_files)
         self.convert_btn.setText(
@@ -574,7 +639,7 @@ class MainWindow(QMainWindow):
         )
 
     def start_normalization(self):
-        if not self.pending_files:
+        if not self.pending_files or self._is_converting:
             return
 
         mode = "replace" if self.replace_cb.isChecked() else "copy"
@@ -604,6 +669,12 @@ class MainWindow(QMainWindow):
         self.output_browse_btn.setEnabled(False)
         self.mirror_cb.setEnabled(False)
         self.file_list.setEnabled(False)
+        self.cancel_btn.setEnabled(True)
+
+        self._is_converting = True
+        self._completed = 0
+        self._total = len(self.pending_files)
+        self._cancel_event.clear()
 
         self._counts = {"normalized": 0, "skipped_range": 0,
                         "skipped_suffix": 0, "failed": 0}
@@ -618,10 +689,23 @@ class MainWindow(QMainWindow):
                 file_path, mode, target_db, tolerance_db,
                 self.output_dir, source_root, preserve,
                 i + 1, len(self.pending_files),
+                cancel_event=self._cancel_event,
             )
             worker.signals.finished.connect(self.on_file_finished)
             worker.signals.progress.connect(self.on_progress_update)
             self.thread_pool.start(worker)
+
+    def cancel_normalization(self):
+        """Drop the queue and kill running ffmpeg processes."""
+        if not self._is_converting:
+            return
+        self._cancel_event.set()
+        try:
+            self.thread_pool.clear()
+        except Exception:
+            pass
+        self.cancel_btn.setEnabled(False)
+        self.status_label.setText("Cancelling... (finishing active files)")
 
     @Slot(NormalizeResult)
     def on_file_finished(self, result: NormalizeResult):
@@ -641,15 +725,24 @@ class MainWindow(QMainWindow):
                 )
         else:
             self._counts["failed"] += 1
-            self.status_label.setText(f"{name}: {result.error}")
+            self.status_label.setText(f"{name}: {(result.error or 'error')[:120]}")
 
     @Slot(int, int)
     def on_progress_update(self, current: int, total: int):
-        self.overall_progress.setValue(current)
-        if current == total:
+        """Count completions (ignore finish order)."""
+        if not self._is_converting:
+            return
+        self._completed += 1
+        span = total if total else self._total
+        self.overall_progress.setRange(0, span)
+        self.overall_progress.setValue(min(self._completed, span))
+        if self._completed >= span:
             self.normalization_complete()
 
     def normalization_complete(self):
+        if not self._is_converting:
+            return
+        self._is_converting = False
         self.convert_btn.setEnabled(True)
         self.clear_btn.setEnabled(True)
         self.remove_btn.setEnabled(True)
@@ -660,6 +753,7 @@ class MainWindow(QMainWindow):
         self.output_browse_btn.setEnabled(True)
         self.mirror_cb.setEnabled(True)
         self.file_list.setEnabled(True)
+        self.cancel_btn.setEnabled(False)
 
         c = self._counts
         summary = (
@@ -668,8 +762,23 @@ class MainWindow(QMainWindow):
             f"{c['skipped_suffix']} already processed | "
             f"{c['failed']} failed"
         )
-        self.status_label.setText("Normalization complete!")
-        QMessageBox.information(self, "Complete", f"Done.\n\n{summary}")
+        if self._cancel_event.is_set():
+            self.status_label.setText(f"Cancelled. {summary}")
+        else:
+            self.status_label.setText("Normalization complete!")
+            QMessageBox.information(self, "Complete", f"Done.\n\n{summary}")
+        self.update_start_button()
+
+    def closeEvent(self, event):
+        """Stop workers cleanly when the window is closed mid-batch."""
+        if self._is_converting:
+            self._cancel_event.set()
+            try:
+                self.thread_pool.clear()
+            except Exception:
+                pass
+            self.thread_pool.waitForDone(2000)
+        super().closeEvent(event)
 
 
 def is_elevated() -> bool:

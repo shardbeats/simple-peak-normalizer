@@ -12,16 +12,27 @@ compression, so dynamics stay untouched).
 The sample rate and bit depth of the source are preserved whenever the
 source is a lossless PCM/FLAC format. Lossy sources (mp3, ogg, ...) are
 re-encoded to WAV to avoid a second generation loss.
+
+Hardened against CPU / disk abuse:
+- every ffprobe/ffmpeg call is bounded by a timeout and cancellable
+- ffmpeg runs capped in threads and output duration, never reads stdin
+- oversized inputs are rejected before any full decode
+- partial outputs are cleaned up; replace mode verifies the output
+  before deleting the original
+- directory scans are capped and never follow symlinks
 """
 
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from threading import Event
+from typing import Callable, Optional, Union
 
 # Hide ffmpeg/ffprobe console window on Windows (no visible cmd window).
 NO_WINDOW_FLAGS = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
@@ -32,10 +43,39 @@ SKIP_SUFFIX = "_N"
 # Files quieter than this (dBFS) are treated as silent and not normalized.
 SILENCE_FLOOR_DB = -90.0
 
+# --- Safety limits -----------------------------------------------------------
+FFPROBE_TIMEOUT = 20      # s max per metadata probe (prevents hung workers)
+MEASURE_TIMEOUT = 300     # s max per volumedetect pass (full decode)
+CONVERT_TIMEOUT = 300     # s max per normalization encode
+CHECK_TIMEOUT = 10        # s max for `ffmpeg -version` checks
+MAX_FILE_BYTES = 250 * 1024 * 1024  # 250 MB input cap (decompression-bomb guard)
+MAX_DURATION_SEC = 1800.0           # 30 min audio cap (bounds both ffmpeg passes)
+MAX_FILES_PER_SCAN = 2000           # cap per folder scan
+MAX_QUEUE_SIZE = 2000               # cap for the GUI queue
+FFMPEG_THREADS = 2                  # cap ffmpeg CPU usage (x2 workers = bounded load)
+MAX_GAIN_DB = 60.0                  # gains above this mean near-silence; refuse
+MIN_OUTPUT_BYTES = 1024             # sanity floor for a written output file
+
 SUPPORTED_EXTENSIONS = {
     ".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac",
     ".aiff", ".aif", ".wma", ".opus", ".webm",
 }
+
+CancelLike = Union[Event, Callable[[], bool], None]
+
+
+def _is_cancelled(cancel_event: CancelLike) -> bool:
+    """Accept threading.Event, callable, or None."""
+    if cancel_event is None:
+        return False
+    try:
+        if isinstance(cancel_event, Event):
+            return cancel_event.is_set()
+        if callable(cancel_event):
+            return bool(cancel_event())
+    except Exception:
+        return False
+    return False
 
 
 @dataclass
@@ -72,23 +112,86 @@ def ffprobe_bin() -> str:
     return "ffprobe"
 
 
-def check_ffmpeg() -> bool:
+def check_ffmpeg(timeout: int = CHECK_TIMEOUT) -> bool:
     """Verify ffmpeg is available (bundled or in PATH)."""
     try:
         subprocess.run([ffmpeg_bin(), "-version"], capture_output=True, check=True,
-                       creationflags=NO_WINDOW_FLAGS)
+                       timeout=timeout, creationflags=NO_WINDOW_FLAGS)
         return True
-    except (subprocess.CalledProcessError, FileNotFoundError):
+    except (subprocess.CalledProcessError, FileNotFoundError,
+            subprocess.TimeoutExpired, OSError):
+        return False
+    except Exception:
         return False
 
 
-def find_audio_files(folder: Path, recursive: bool = True) -> list[Path]:
-    """Find all supported audio files in a folder."""
-    pattern = "**/*" if recursive else "*"
-    files = []
-    for ext in SUPPORTED_EXTENSIONS:
-        files.extend(folder.glob(f"{pattern}{ext}"))
-        files.extend(folder.glob(f"{pattern}{ext.upper()}"))
+def find_audio_files(
+    folder: Path, recursive: bool = True, max_files: int = MAX_FILES_PER_SCAN
+) -> list[Path]:
+    """Find all supported audio files in a folder.
+
+    Bounded (max_files), never follows symlinks (loop/junction guard),
+    single-pass case-insensitive extension check.
+    """
+    try:
+        base = Path(folder)
+        if not base.is_dir():
+            return []
+    except OSError:
+        return []
+    try:
+        if base.is_symlink():
+            return []
+    except OSError:
+        return []
+
+    files: list[Path] = []
+    try:
+        if not recursive:
+            try:
+                with os.scandir(base) as it:
+                    for entry in it:
+                        if len(files) >= max_files:
+                            break
+                        try:
+                            if entry.is_symlink():
+                                continue
+                            if not entry.is_file(follow_symlinks=False):
+                                continue
+                            if Path(entry.name).suffix.lower() in SUPPORTED_EXTENSIONS:
+                                files.append(Path(entry.path))
+                        except OSError:
+                            continue
+            except OSError:
+                return []
+            return sorted(set(files))
+
+        base_str = str(base)
+        for root, dirs, filenames in os.walk(base_str, topdown=True, followlinks=False):
+            # Never descend into symlinked dirs (junction/loop guard) + depth cap.
+            try:
+                root_depth = len(Path(root).relative_to(base).parts)
+            except ValueError:
+                root_depth = 0
+            if root_depth > 25:
+                dirs[:] = []
+                continue
+            dirs[:] = [d for d in dirs
+                       if not (Path(root, d).is_symlink()) and not d.startswith("$")]
+            for name in filenames:
+                if len(files) >= max_files:
+                    return sorted(set(files))
+                if Path(name).suffix.lower() not in SUPPORTED_EXTENSIONS:
+                    continue
+                full = Path(root) / name
+                try:
+                    if full.is_symlink():
+                        continue
+                except OSError:
+                    continue
+                files.append(full)
+    except OSError:
+        pass
     return sorted(set(files))
 
 
@@ -97,8 +200,21 @@ def _null_output() -> str:
     return "NUL" if os.name == "nt" else "/dev/null"
 
 
-def get_stream_info(file_path: Path) -> Optional[dict]:
-    """Extract the audio stream metadata from ffprobe (raw dict)."""
+def _is_oversized(file_path: Path) -> bool:
+    """True when the input exceeds the pre-decode size guard."""
+    try:
+        return file_path.stat().st_size > MAX_FILE_BYTES
+    except OSError:
+        return False
+
+
+def get_stream_info(file_path: Path, timeout: int = FFPROBE_TIMEOUT) -> Optional[dict]:
+    """Extract the audio stream metadata from ffprobe (always time-bounded)."""
+    try:
+        if not Path(file_path).is_file():
+            return None
+    except OSError:
+        return None
     cmd = [
         ffprobe_bin(), "-v", "quiet",
         "-print_format", "json",
@@ -108,42 +224,123 @@ def get_stream_info(file_path: Path) -> Optional[dict]:
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True, check=True,
-            creationflags=NO_WINDOW_FLAGS,
+            timeout=timeout, creationflags=NO_WINDOW_FLAGS,
         )
         data = json.loads(result.stdout)
         for stream in data.get("streams", []):
             if stream.get("codec_type") == "audio":
                 return stream
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError,
+            FileNotFoundError, OSError):
+        pass
     except Exception:
         pass
     return None
 
 
-def measure_peak_db(file_path: Path) -> Optional[float]:
+def _run_bounded(cmd: list[str], timeout: int,
+                 cancel_event: CancelLike = None) -> tuple[Optional[int], str]:
+    """Run a subprocess with timeout + cancellation.
+
+    Returns (returncode or None on timeout/cancel, stderr text).
+    stdout is discarded (volumedetect/normalize logs go to stderr).
+    """
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            creationflags=NO_WINDOW_FLAGS,
+        )
+    except FileNotFoundError:
+        return -1, "ffmpeg not found"
+    except Exception as exc:
+        return -1, str(exc)
+
+    deadline = time.monotonic() + max(1, int(timeout))
+    timed_out = False
+    try:
+        while True:
+            try:
+                returncode = proc.wait(timeout=0.1)
+                break
+            except subprocess.TimeoutExpired:
+                if _is_cancelled(cancel_event):
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=5)
+                    except Exception:
+                        pass
+                    try:
+                        _, stderr = proc.communicate(timeout=5)
+                    except Exception:
+                        stderr = ""
+                    return None, (stderr or "")
+                if time.monotonic() > deadline:
+                    timed_out = True
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=5)
+                    except Exception:
+                        pass
+                    break
+                continue
+        try:
+            _, stderr = proc.communicate(timeout=5)
+        except Exception:
+            stderr = ""
+        if timed_out:
+            return None, (stderr or "")
+        return returncode, (stderr or "")
+    except Exception as exc:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return -1, str(exc)
+
+
+def measure_peak_db(
+    file_path: Path,
+    timeout: int = MEASURE_TIMEOUT,
+    cancel_event: CancelLike = None,
+) -> Optional[float]:
     """Measure the peak level (dBFS) of a file using ffmpeg volumedetect.
 
-    Returns None when the file can't be analyzed (missing, unsupported,
-    silent, or ffmpeg error).
+    Returns None when the file can't be analyzed (missing, oversized,
+    unsupported, silent, cancelled, or ffmpeg error/timeout).
     """
+    try:
+        p = Path(file_path)
+        if not p.is_file():
+            return None
+    except OSError:
+        return None
+    if _is_oversized(p):
+        return None
+    if _is_cancelled(cancel_event):
+        return None
     cmd = [
-        ffmpeg_bin(), "-i", str(file_path),
+        ffmpeg_bin(),
+        "-nostdin", "-hide_banner",
+        "-i", str(file_path),
+        "-vn", "-threads", str(FFMPEG_THREADS),
+        "-t", str(int(MAX_DURATION_SEC)),
         "-af", "volumedetect",
         "-f", "null", _null_output(),
     ]
-    try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=300,
-            creationflags=NO_WINDOW_FLAGS,
-        )
-    except Exception:
-        return None
-    if result.returncode != 0:
+    returncode, stderr = _run_bounded(cmd, timeout, cancel_event)
+    if returncode != 0:
         return None
 
-    match = re.search(r"max_volume:\s*(-?\d+(?:\.\d+)?)\s*dB", result.stderr)
+    match = re.search(r"max_volume:\s*(-?\d+(?:\.\d+)?)\s*dB", stderr)
     if not match:
         return None
-    peak = float(match.group(1))
+    try:
+        peak = float(match.group(1))
+    except (TypeError, ValueError):
+        return None
     if peak < SILENCE_FLOOR_DB:
         return None
     return peak
@@ -179,7 +376,10 @@ def encode_args(stream: dict, ext: str) -> tuple[str, list[str]]:
         return ".wav", ["-c:a", "pcm_f64le"]
 
     if codec == "flac":
-        bit_depth = int(bits_raw) if bits_raw else 16
+        try:
+            bit_depth = int(bits_raw) if bits_raw else 16
+        except (TypeError, ValueError):
+            bit_depth = 16
         sample_fmt = "s32" if bit_depth >= 24 else "s16"
         return ".flac", ["-c:a", "flac", "-sample_fmt", sample_fmt]
 
@@ -241,14 +441,53 @@ def build_normalize_cmd(
     """ffmpeg command that applies a pure linear gain (no dynamics change).
 
     The sample rate is intentionally NOT passed, so it is preserved.
+    Bounded: capped threads and output duration, never reads from stdin.
     """
+    try:
+        gain = float(gain_db)
+    except (TypeError, ValueError):
+        gain = 0.0
+    gain = max(-MAX_GAIN_DB, min(MAX_GAIN_DB, gain))
     return [
-        ffmpeg_bin(), "-y",
+        ffmpeg_bin(),
+        "-nostdin", "-hide_banner", "-loglevel", "error",
+        "-y",
         "-i", str(input_path),
-        "-af", f"volume={gain_db:.3f}dB",
+        "-vn",
+        "-af", f"volume={gain:.3f}dB",
         *codec_args,
+        "-threads", str(FFMPEG_THREADS),
+        "-t", str(int(MAX_DURATION_SEC)),
         str(output_path),
     ]
+
+
+def _cleanup_partial(path: Path) -> None:
+    try:
+        if path.exists():
+            path.unlink()
+    except OSError:
+        pass
+
+
+def _clamp_target(value: float, lo: float, hi: float, default: float) -> float:
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, v))
+
+
+def _output_looks_valid(path: Path) -> bool:
+    """Cheap sanity check before replace mode deletes the original."""
+    try:
+        if not path.is_file():
+            return False
+        if path.stat().st_size < MIN_OUTPUT_BYTES:
+            return False
+    except OSError:
+        return False
+    return get_stream_info(path) is not None
 
 
 def normalize_file(
@@ -259,6 +498,8 @@ def normalize_file(
     output_dir: Optional[Path] = None,
     source_root: Optional[Path] = None,
     preserve_structure: bool = False,
+    timeout: int = CONVERT_TIMEOUT,
+    cancel_event: CancelLike = None,
 ) -> NormalizeResult:
     """Normalize a single file to its own peak level.
 
@@ -267,22 +508,41 @@ def normalize_file(
       skipped (no output written, no extra copy made).
     - output_dir / source_root / preserve_structure control where the
       normalized file lands (see resolve_output_base). "Replace" only
-      deletes the original when writing next to it (in place).
+      deletes the original when writing next to it (in place), and only
+      after the output passes a sanity check (original is never lost
+      to a truncated write).
     """
-    if not input_path.exists():
+    if _is_cancelled(cancel_event):
+        return NormalizeResult(False, input_path, error="Cancelled")
+    try:
+        if not input_path.is_file():
+            return NormalizeResult(False, input_path, error="Input file not found")
+    except OSError:
         return NormalizeResult(False, input_path, error="Input file not found")
+
+    if _is_oversized(input_path):
+        mb = MAX_FILE_BYTES // (1024 * 1024)
+        return NormalizeResult(False, input_path, error=f"File too large (>{mb} MB), skipped")
 
     if input_path.stem.lower().endswith(SKIP_SUFFIX.lower()):
         return NormalizeResult(True, input_path, action="skipped_suffix")
 
-    peak = measure_peak_db(input_path)
+    # Clamp user-facing parameters (GUI bounds them, API callers may not).
+    target_db = _clamp_target(target_db, -60.0, 0.0, -1.0)
+    tolerance_db = _clamp_target(tolerance_db, 0.0, 12.0, 0.5)
+
+    peak = measure_peak_db(input_path, cancel_event=cancel_event)
     if peak is None:
+        if _is_cancelled(cancel_event):
+            return NormalizeResult(False, input_path, error="Cancelled")
         return NormalizeResult(
             False, input_path,
             error="Could not analyze audio (silent or unsupported file?)",
         )
 
     gain_db = target_db - peak
+    if gain_db > MAX_GAIN_DB:
+        return NormalizeResult(False, input_path, error="File too quiet, skipped")
 
     # Already within the acceptable range -> nothing to do.
     if abs(gain_db) <= tolerance_db:
@@ -293,6 +553,11 @@ def normalize_file(
     stream = get_stream_info(input_path)
     ext = input_path.suffix.lower()
     if stream:
+        try:
+            if float(stream.get("duration", 0) or 0) > MAX_DURATION_SEC:
+                return NormalizeResult(False, input_path, error="Audio too long, skipped")
+        except (TypeError, ValueError):
+            pass
         out_ext, codec_args = encode_args(stream, ext)
     else:
         out_ext, codec_args = ".wav", ["-c:a", "pcm_s16le"]
@@ -305,30 +570,41 @@ def normalize_file(
         # The source is the processed name; nothing to do.
         return NormalizeResult(True, input_path, action="skipped_suffix")
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return NormalizeResult(False, input_path, error=f"Cannot create output folder: {exc}")
+
+    if _is_cancelled(cancel_event):
+        return NormalizeResult(False, input_path, error="Cancelled")
 
     cmd = build_normalize_cmd(input_path, output_path, gain_db, codec_args)
-    try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=300,
-            creationflags=NO_WINDOW_FLAGS,
-        )
-    except subprocess.TimeoutExpired:
+    returncode, stderr = _run_bounded(cmd, timeout, cancel_event)
+
+    if returncode is None:
+        _cleanup_partial(output_path)
+        if _is_cancelled(cancel_event):
+            return NormalizeResult(False, input_path, error="Cancelled")
         return NormalizeResult(False, input_path, error="Conversion timeout")
-    except Exception as exc:  # pragma: no cover
-        return NormalizeResult(False, input_path, error=str(exc))
 
-    if result.returncode != 0 or not output_path.exists():
-        return NormalizeResult(
-            False, input_path,
-            error=(result.stderr or "Unknown ffmpeg error").strip(),
-        )
+    if returncode != 0 or not output_path.exists():
+        _cleanup_partial(output_path)
+        err = (stderr or "").strip().splitlines()
+        err = err[-1][:500] if err else "Unknown ffmpeg error"
+        return NormalizeResult(False, input_path, error=err)
 
-    # Replace mode: remove the original once the normalized copy exists.
-    # Only meaningful when writing next to the source (in place).
+    # Replace mode: remove the original once the normalized copy exists
+    # AND passes a sanity check. Only meaningful when writing next to
+    # the source (in place).
     base = resolve_output_base(input_path, output_dir, source_root, preserve_structure)
     in_place = base == input_path.parent
     if mode == "replace" and in_place and input_path.exists():
+        if not _output_looks_valid(output_path):
+            _cleanup_partial(output_path)
+            return NormalizeResult(
+                False, input_path, gain_db=gain_db,
+                error="Output verification failed, original kept",
+            )
         try:
             input_path.unlink()
         except OSError as exc:
