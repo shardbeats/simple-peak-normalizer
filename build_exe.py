@@ -1,4 +1,4 @@
-"""Build a portable .exe of Simple Peak Normalizer with PyInstaller.
+"""Build a portable .exe of TRAKKNORMALIZER with PyInstaller.
 
 Bundles the FFmpeg binaries (ffmpeg.exe / ffprobe.exe) and styles.qss
 inside the one-file executable. Run from the project folder:
@@ -46,7 +46,7 @@ def main() -> int:
         "--noconfirm", "--clean",
         "--onefile", "--windowed",
         *icon_args,
-        "--name", "SimplePeakNormalizer",
+        "--name", "TRAKKNORMALIZER",
         "--add-data", f"{ROOT / 'styles.qss'};.",
         "--add-binary", f"{ffmpeg};.",
         "--add-binary", f"{ffprobe};.",

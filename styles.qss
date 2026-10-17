@@ -1,4 +1,4 @@
-/* Simple Peak Normalizer stylesheet */
+/* TRAKKNORMALIZER stylesheet */
 
 QMainWindow, QWidget {
     background-color: #151617;

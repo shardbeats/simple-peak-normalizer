@@ -1,4 +1,4 @@
-"""Simple Peak Normalizer - peak normalization GUI using PySide6.
+"""TRAKKNORMALIZER - peak normalization GUI using PySide6.
 
 """
 
@@ -189,7 +189,7 @@ class DropListWidget(QListWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Simple Peak Normalizer")
+        self.setWindowTitle("TRAKKNORMALIZER")
         self.setAcceptDrops(True)
 
         desired_w, desired_h = 900, 360
@@ -258,7 +258,7 @@ class MainWindow(QMainWindow):
             return box, layout
 
         # ---- Title ----
-        title_label = QLabel("Simple Peak Normalizer")
+        title_label = QLabel("TRAKKNORMALIZER")
         title_label.setObjectName("titleLabel")
         title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title_label.setMinimumHeight(32)
@@ -800,7 +800,7 @@ def load_app_icon() -> Optional[QIcon]:
 
 def main():
     app = QApplication(sys.argv)
-    app.setApplicationName("Simple Peak Normalizer")
+    app.setApplicationName("TRAKKNORMALIZER")
     app.setApplicationVersion("1.0.0")
 
     app_icon = load_app_icon()

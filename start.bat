@@ -1,10 +1,10 @@
 @echo off
 setlocal EnableExtensions
-title Simple Peak Normalizer - Setup
+title TRAKKNORMALIZER - Setup
 cd /d "%~dp0"
 
 echo ================================================
-echo   Simple Peak Normalizer
+echo   TRAKKNORMALIZER
 echo   First-run setup + launch
 echo ================================================
 echo.

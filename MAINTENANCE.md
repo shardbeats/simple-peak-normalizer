@@ -1,11 +1,11 @@
-# Maintenance guide — Simple Peak Normalizer
+# Maintenance guide — TRAKKNORMALIZER
 
 Practical guide to keep this application running for years.
 
 ## 1. Project map (what touches what)
 
 ```
-peak_normalizer/
+trakknormalizer/
 ├── main.py            Entry point. Calls gui.main().
 ├── gui.py             PySide6 window + drag&drop + queue with overall progress.
 ├── normalizer.py      EVERYTHING that talks to FFmpeg:
@@ -70,7 +70,7 @@ won't break each other.
 ## 5. Rebuilding the portable exe
 
 ```powershell
-python build_exe.py   # builds dist\SimplePeakNormalizer.exe
+python build_exe.py   # builds dist\TRAKKNORMALIZER.exe
 ```
 
 - `icon.ico` is used when present; otherwise the exe gets the default icon

@@ -1,4 +1,4 @@
-"""Simple Peak Normalizer
+"""TRAKKNORMALIZER
 
 - FFmpeg/ffprobe helpers (ffmpeg_bin / ffprobe_bin / check_ffmpeg)
 - Audio file discovery (find_audio_files)
